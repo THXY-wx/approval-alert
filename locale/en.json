@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Approval alert",
+    "description": "Raises an always-on-top Windows card and a chime when the model asks for approval, waits for an answer, or finishes a reply, so a background run cannot go unnoticed."
+  }
+}

@@ -1,0 +1,13 @@
+- insert:
+    - id: approval-alert
+      name: '@local/dsh-approval-alert'
+      config:
+        enabled: true
+        sound: true
+        title: 需要授权确认
+        questionTitle: 需要你的回答
+        notifyQuestions: false
+        notifyFinished: true
+        finishedTitle: AI 已回答完成
+        autoCloseSeconds: 0
+        maxPopups: 4
