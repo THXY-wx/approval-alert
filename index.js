@@ -31,6 +31,12 @@ import { fileURLToPath } from 'node:url'
 export const name = 'approval-alert'
 
 const SCRIPT_FILE = 'popup.ps1'
+/**
+ * The card script is kept ASCII-only so a missing byte-order mark can never turn
+ * its Chinese literals into parse errors under Windows PowerShell 5.1; every
+ * localized string therefore arrives from here.
+ */
+const ACTION_LABEL = '打开 Harness'
 const DEFAULT_TITLE = '需要授权确认'
 const DEFAULT_QUESTION_TITLE = '需要你的回答'
 const DEFAULT_FINISHED_TITLE = 'AI 已回答完成'
@@ -314,6 +320,7 @@ export function apply(ctx, config) {
       DSH_ALERT_HEADLINE: oneLine(card.headline, MAX_HEADLINE_CHARS),
       DSH_ALERT_DETAIL: oneLine(card.detail, MAX_DETAIL_CHARS),
       DSH_ALERT_HINT: oneLine(card.hint, MAX_HINT_CHARS),
+      DSH_ALERT_ACTION: ACTION_LABEL,
       DSH_ALERT_SOUND: card.sound ? '1' : '0',
       DSH_ALERT_TIMEOUT: String(card.timeout),
       DSH_ALERT_CLOSE_ON_FOCUS: card.closeOnFocus ? '1' : '0',

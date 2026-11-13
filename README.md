@@ -34,8 +34,14 @@ ctx.on('approval/request', async (request, next) => {
 - 主行：`AI 请求使用工具：pwsh`、`AI 正在等待你的回答`、或 `回答已完成，可以查看`
 - 详情：申请原因 / 问题内容 / **回答开头的 110 字预览**
 - 底行：`会话 27424d7c · 处理完成后自动关闭`
-- 「打开 Harness」按钮：把 Harness 窗口切到前台并收起提示卡（用任务栏同款
-  `SwitchToThisWindow`，避免被 Windows 前台锁拦下）
+- 「打开 Harness」按钮：把 Harness 窗口切到前台并收起提示卡
+  - 窗口定位不依赖 Host 进程号：桌面版可能把 Host 跑在子进程里（实测宿主 pid 17420、
+    窗口属于 15700），所以依次尝试 **宿主进程号 → 标题匹配且进程名是 `DeepSeek Harness`
+    → 任意标题匹配**，并按“可见 / 已最小化或藏在托盘”排序
+  - 已最小化或隐藏时先 `ShowWindow(SW_RESTORE)` 再 `SwitchToThisWindow`（任务栏同款，
+    可绕开 Windows 前台锁）；切完还会校验前台 pid
+  - 切不过去时**保留卡片**并在底行写明“没找到 Harness 窗口，请用任务栏打开”，
+    不再像以前那样卡片无声消失
 
 实现方式是每张卡一个独立 `powershell.exe` 进程，运行同目录的 `popup.ps1`，用 WinForms 画一张
 `TopMost` 卡片（暗色/亮色跟随 Windows 应用主题，多屏时出现在鼠标所在屏幕，多张卡向上堆叠）。
@@ -64,6 +70,9 @@ Harness 本来就是前台窗口，卡片不响铃，避免聊天时每轮都响
 ## 限制
 
 - 仅 Windows：卡片依赖 `powershell.exe` + WinForms。
+- `popup.ps1` 必须保持**纯 ASCII**：Windows PowerShell 5.1 会把无 BOM 的脚本按 GBK 读取，
+  任何中文字面量都可能吞掉引号变成语法错误，脚本会在启动瞬间退出（卡片、日志都没有）。
+  中文字样一律由 `index.js` 通过 `DSH_ALERT_*` 环境变量传入（含按钮文案 `DSH_ALERT_ACTION`）。
 - 不使用 Windows 通知中心，因为通知会在几秒后自动收起，挂机时会错过；置顶卡片会一直留到
   申请结束或用户回到 Harness。
 - 卡片是独立进程，不跟随 Harness 的界面主题 token，只跟随 Windows 的明暗主题。

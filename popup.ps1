@@ -1,4 +1,4 @@
-﻿# DeepSeek Harness alert card.
+# DeepSeek Harness alert card.
 #
 # Launched by the `approval-alert` Host plugin once per card. Everything rendered
 # here arrives through DSH_ALERT_* environment variables, so no model text ever
@@ -33,20 +33,21 @@ function Get-EnvInt([string] $name, [int] $fallback) {
     return $fallback
 }
 
-$title         = Get-EnvText 'DSH_ALERT_TITLE' '需要授权确认'
+$title         = Get-EnvText 'DSH_ALERT_TITLE' 'Approval needed'
 $kind          = Get-EnvText 'DSH_ALERT_KIND' 'approval'
-$headline      = Get-EnvText 'DSH_ALERT_HEADLINE' 'AI 需要你的确认'
-$detail        = Get-EnvText 'DSH_ALERT_DETAIL' '请切换到 DeepSeek Harness 处理'
+$headline      = Get-EnvText 'DSH_ALERT_HEADLINE' 'DeepSeek Harness needs your attention'
+$detail        = Get-EnvText 'DSH_ALERT_DETAIL' 'Switch to DeepSeek Harness to handle this request'
 $hint          = Get-EnvText 'DSH_ALERT_HINT' ''
+$action        = Get-EnvText 'DSH_ALERT_ACTION' 'Open Harness'
 $sound         = (Get-EnvText 'DSH_ALERT_SOUND' '1') -eq '1'
 $timeout       = Get-EnvInt 'DSH_ALERT_TIMEOUT' 0
 $ownerPid      = Get-EnvInt 'DSH_ALERT_OWNER_PID' 0
 $index         = [Math]::Max(0, (Get-EnvInt 'DSH_ALERT_INDEX' 0))
 $closeOnFocus  = (Get-EnvText 'DSH_ALERT_CLOSE_ON_FOCUS' '0') -eq '1'
 
-if ($title.Length -gt 60) { $title = $title.Substring(0, 59) + '…' }
+if ($title.Length -gt 60) { $title = $title.Substring(0, 57) + '...' }
 $detail = ($detail -replace '\s+', ' ').Trim()
-if ($detail.Length -gt 150) { $detail = $detail.Substring(0, 149) + '…' }
+if ($detail.Length -gt 150) { $detail = $detail.Substring(0, 147) + '...' }
 
 # ---------------------------------------------------------------------------
 # Theme: follow the Windows app theme so the card looks native in both modes.
@@ -130,22 +131,31 @@ public static class DshAlertActivate
     [DllImport("user32.dll")]
     public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
 
-    public static IntPtr FindByPid(int want)
+    [DllImport("user32.dll")]
+    static extern bool IsIconic(IntPtr h);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr h, int cmd);
+
+    /// Every top-level window with a non-empty title, as
+    /// "handle\tpid\tvisible\ticonic\ttitle". Hidden windows are included on
+    /// purpose: Harness may be sitting in the tray while the card is up.
+    public static string[] ListWindows()
     {
-        IntPtr hit = IntPtr.Zero;
+        var rows = new System.Collections.Generic.List<string>();
         EnumWindows((h, l) =>
         {
-            if (!IsWindowVisible(h)) return true;
-            int pid = 0;
-            GetWindowThreadProcessId(h, out pid);
-            if (pid != want) return true;
             var sb = new StringBuilder(512);
             GetWindowText(h, sb, 512);
             if (sb.Length == 0) return true;
-            hit = h;
-            return false;
+            int pid = 0;
+            GetWindowThreadProcessId(h, out pid);
+            rows.Add(h.ToInt64().ToString() + "\t" + pid.ToString() + "\t"
+                + (IsWindowVisible(h) ? "1" : "0") + "\t" + (IsIconic(h) ? "1" : "0")
+                + "\t" + sb.ToString());
+            return true;
         }, IntPtr.Zero);
-        return hit;
+        return rows.ToArray();
     }
 
     public static int ForegroundPid()
@@ -162,9 +172,105 @@ public static class DshAlertActivate
     $canSwitch = $false
 }
 
+# ---------------------------------------------------------------------------
+# Locate the Harness window. The Host process is not necessarily the window
+# owner (the desktop build may run the host in a child process), so the pid is
+# only a hint: the window title and the process name are the fallbacks.
+# ---------------------------------------------------------------------------
+
+$appTitlePart = 'DeepSeek Harness'
+$appProcessName = 'DeepSeek Harness'
+
+function Find-AppWindow {
+    param([string[]] $Rows, [int] $WantPid, [string] $TitlePart, [string] $ProcessName)
+
+    $pidVisible = $null
+    $pidHidden = $null
+    $appVisible = $null
+    $appHidden = $null
+    $titleVisible = $null
+    $titleHidden = $null
+
+    foreach ($row in $Rows) {
+        $fields = $row -split "`t"
+        if ($fields.Count -lt 5) { continue }
+        $entry = @{
+            Handle  = [IntPtr][long]$fields[0]
+            Pid     = [int]$fields[1]
+            Visible = $fields[2] -eq '1'
+            Iconic  = $fields[3] -eq '1'
+            Title   = $fields[4]
+        }
+        if ($WantPid -gt 0 -and $entry.Pid -eq $WantPid) {
+            if ($entry.Visible -and $null -eq $pidVisible) { $pidVisible = $entry }
+            elseif (-not $entry.Visible -and $null -eq $pidHidden) { $pidHidden = $entry }
+        }
+        if ($entry.Title -like "*$TitlePart*") {
+            # A browser tab can carry the same words in its title, so a matching
+            # title only wins outright when the owning process is Harness itself.
+            $isApp = $false
+            try {
+                $isApp = ((Get-Process -Id $entry.Pid -ErrorAction Stop).ProcessName -eq $ProcessName)
+            } catch {
+                $isApp = $false
+            }
+            if ($isApp) {
+                if ($entry.Visible -and $null -eq $appVisible) { $appVisible = $entry }
+                elseif (-not $entry.Visible -and $null -eq $appHidden) { $appHidden = $entry }
+            } else {
+                if ($entry.Visible -and $null -eq $titleVisible) { $titleVisible = $entry }
+                elseif (-not $entry.Visible -and $null -eq $titleHidden) { $titleHidden = $entry }
+            }
+        }
+    }
+
+    if ($null -ne $pidVisible) { $pidVisible.Why = 'owner-pid'; return $pidVisible }
+    if ($null -ne $appVisible) { $appVisible.Why = 'app-process'; return $appVisible }
+    if ($null -ne $pidHidden) { $pidHidden.Why = 'owner-pid-hidden'; return $pidHidden }
+    if ($null -ne $appHidden) { $appHidden.Why = 'app-process-hidden'; return $appHidden }
+    if ($null -ne $titleVisible) { $titleVisible.Why = 'window-title'; return $titleVisible }
+    if ($null -ne $titleHidden) { $titleHidden.Why = 'window-title-hidden'; return $titleHidden }
+    return $null
+}
+
+$rows = @()
+$target = $null
+if ($canSwitch) {
+    try {
+        $rows = [DshAlertActivate]::ListWindows()
+        $target = Find-AppWindow -Rows $rows -WantPid $ownerPid -TitlePart $appTitlePart -ProcessName $appProcessName
+    } catch {
+        $target = $null
+    }
+}
+if ($null -eq $target) {
+    try {
+        $proc = Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if ($null -ne $proc) {
+            $target = @{
+                Handle  = [IntPtr]$proc.MainWindowHandle
+                Pid     = $proc.Id
+                Visible = $true
+                Iconic  = $false
+                Title   = $proc.MainWindowTitle
+                Why     = 'process-name'
+            }
+        }
+    } catch {
+        $target = $null
+    }
+}
+
 $appFocused = $false
-if ($canSwitch -and $ownerPid -gt 0) {
-    try { $appFocused = ([DshAlertActivate]::ForegroundPid() -eq $ownerPid) } catch { $appFocused = $false }
+if ($canSwitch) {
+    try {
+        $foreground = [DshAlertActivate]::ForegroundPid()
+        $appFocused = ($ownerPid -gt 0 -and $foreground -eq $ownerPid) -or
+            ($null -ne $target -and $foreground -eq $target.Pid)
+    } catch {
+        $appFocused = $false
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -222,17 +328,18 @@ Add-Label $card $title 24 14 320 26 $titleFont $titleColor | Out-Null
 Add-Label $card $headline 24 48 372 22 $bodyFont $bodyColor | Out-Null
 Add-Label $card $detail 24 72 372 22 $bodyFont $mutedColor | Out-Null
 
+$hintLabel = $null
 if ($hint.Length -gt 0) {
-    Add-Label $card $hint 24 108 244 18 $hintFont $mutedColor | Out-Null
+    $hintLabel = Add-Label $card $hint 24 108 244 18 $hintFont $mutedColor
 }
 
-$close = Add-Label $card '✕' 384 8 24 24 $hintFont $mutedColor
+$close = Add-Label $card 'X' 384 8 24 24 $titleFont $mutedColor
 $close.Cursor = [System.Windows.Forms.Cursors]::Hand
 $close.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $close.Add_Click({ $form.Close() })
 
 $open = New-Object System.Windows.Forms.Button
-$open.Text = '打开 Harness'
+$open.Text = $action
 $open.Location = New-Object System.Drawing.Point(284, 100)
 $open.Size = New-Object System.Drawing.Size(120, 30)
 $open.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
@@ -241,30 +348,56 @@ $open.BackColor = $accentColor
 $open.ForeColor = $buttonText
 $open.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 $open.Cursor = [System.Windows.Forms.Cursors]::Hand
-$open.Add_Click({
-    if ($ownerPid -gt 0) {
-        $done = $false
-        if ($canSwitch) {
-            try {
-                $target = [DshAlertActivate]::FindByPid($ownerPid)
-                if ($target -ne [IntPtr]::Zero) {
-                    [DshAlertActivate]::SwitchToThisWindow($target, $true)
-                    $done = $true
-                }
-            } catch {
-                $done = $false
+function Invoke-ActivateHarness {
+    $result = @{ Activated = $false; Why = 'none' }
+
+    if ($null -ne $target) {
+        try {
+            if ($target.Iconic -or -not $target.Visible) {
+                # SW_RESTORE also reveals a window that is hidden in the tray.
+                [DshAlertActivate]::ShowWindow($target.Handle, 9) | Out-Null
             }
-        }
-        if (-not $done) {
-            try {
-                Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-                [Microsoft.VisualBasic.Interaction]::AppActivate($ownerPid) | Out-Null
-            } catch {
-                # The Host window may be gone; closing the card is still the right move.
+            [DshAlertActivate]::SwitchToThisWindow($target.Handle, $true)
+            Start-Sleep -Milliseconds 250
+            if ([DshAlertActivate]::ForegroundPid() -eq $target.Pid) {
+                $result.Activated = $true
+                $result.Why = $target.Why
+                return $result
             }
+        } catch {
+            $result.Why = 'switch-failed'
         }
     }
-    $form.Close()
+
+    if ($ownerPid -gt 0 -and $canSwitch) {
+        try {
+            # Activate the window-owning process, not the Host process: the
+            # desktop build may run the host as a child without a window.
+            $activatePid = if ($null -ne $target) { $target.Pid } else { $ownerPid }
+            Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+            [Microsoft.VisualBasic.Interaction]::AppActivate($activatePid) | Out-Null
+            Start-Sleep -Milliseconds 200
+            if ([DshAlertActivate]::ForegroundPid() -eq $activatePid) {
+                $result.Activated = $true
+                $result.Why = 'appactivate'
+            }
+        } catch {
+            # Nothing else to try; the caller reports the failure on the card.
+        }
+    }
+
+    return $result
+}
+
+$open.Add_Click({
+    $attempt = Invoke-ActivateHarness
+    if ($attempt.Activated) {
+        $form.Close()
+    } elseif ($null -ne $hintLabel) {
+        # Keep the card: a silent disappearance would look like a dead button.
+        $hintLabel.Text = 'Harness window not found - open it from the taskbar'
+        $hintLabel.ForeColor = $accentColor
+    }
 })
 $card.Controls.Add($open)
 
