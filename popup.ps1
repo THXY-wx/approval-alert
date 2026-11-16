@@ -389,9 +389,14 @@ function Invoke-ActivateHarness {
     return $result
 }
 
+$script:openRequested = $false
+
 $open.Add_Click({
     $attempt = Invoke-ActivateHarness
     if ($attempt.Activated) {
+        # Exit code 42 tells the Host which session the user asked to see; the
+        # browser half is what actually switches the Conversation.
+        $script:openRequested = $true
         $form.Close()
     } elseif ($null -ne $hintLabel) {
         # Keep the card: a silent disappearance would look like a dead button.
@@ -485,3 +490,5 @@ if ($ownerPid -gt 0) {
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
+
+if ($script:openRequested) { exit 42 }

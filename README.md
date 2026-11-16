@@ -34,14 +34,16 @@ ctx.on('approval/request', async (request, next) => {
 - 主行：`AI 请求使用工具：pwsh`、`AI 正在等待你的回答`、或 `回答已完成，可以查看`
 - 详情：申请原因 / 问题内容 / **回答开头的 110 字预览**
 - 底行：`会话 27424d7c · 处理完成后自动关闭`
-- 「打开 Harness」按钮：把 Harness 窗口切到前台并收起提示卡
+- 「打开 Harness」按钮：把 Harness 窗口切到前台，**并切到发起这条提醒的那个会话**
   - 窗口定位不依赖 Host 进程号：桌面版可能把 Host 跑在子进程里（实测宿主 pid 17420、
     窗口属于 15700），所以依次尝试 **宿主进程号 → 标题匹配且进程名是 `DeepSeek Harness`
     → 任意标题匹配**，并按“可见 / 已最小化或藏在托盘”排序
   - 已最小化或隐藏时先 `ShowWindow(SW_RESTORE)` 再 `SwitchToThisWindow`（任务栏同款，
     可绕开 Windows 前台锁）；切完还会校验前台 pid
-  - 切不过去时**保留卡片**并在底行写明“没找到 Harness 窗口，请用任务栏打开”，
-    不再像以前那样卡片无声消失
+  - 切不过去时**保留卡片**并在底行写明“没找到 Harness 窗口，请用任务栏打开”
+  - 会话跳转：卡片进程没有回传给页面的通道，所以按钮激活成功后以**退出码 42** 告知 Host；
+    Host 记下“待打开会话”，浏览器端 `client.js` 轮询 `GET /approval-alert/open?since=N`
+    拿到后调用 `ctx.uiWorkspace.openSession(sessionId)` 切换会话（20 秒内有效，过期的点击不生效）
 
 实现方式是每张卡一个独立 `powershell.exe` 进程，运行同目录的 `popup.ps1`，用 WinForms 画一张
 `TopMost` 卡片（暗色/亮色跟随 Windows 应用主题，多屏时出现在鼠标所在屏幕，多张卡向上堆叠）。
@@ -83,7 +85,8 @@ Harness 本来就是前台窗口，卡片不响铃，避免聊天时每轮都响
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | Host 插件：挂 `approval/request`、`user-questions/request`、`session/event`，起停卡片进程 |
+| `index.js` | Host 插件：挂 `approval/request`、`user-questions/request`、`session/event`，起停卡片进程，提供 `/approval-alert/open` |
+| `client.js` | 浏览器插件：轮询待打开会话并调用 `uiWorkspace.openSession()` |
 | `popup.ps1` | 卡片本体：WinForms 置顶窗口、配色、响铃、按钮、焦点/看门狗定时器 |
 | `cordis.patch.yml` | 插入行与默认配置 |
 | `locale/*.json` | 插件列表里的标题和说明 |

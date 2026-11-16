@@ -50,6 +50,19 @@ const MAX_POPUPS = 8
 const MAX_AUTO_CLOSE_SECONDS = 86400
 
 /**
+ * A card exits with this code when its action button activated the window, which
+ * is how the Host learns that the user asked to see that session. It travels as
+ * a process exit status because the card process has no other channel back.
+ */
+const EXIT_OPEN_SESSION = 42
+
+/** How long a click stays meaningful; a stale click must not move the page later. */
+const MAX_OPEN_AGE_MS = 20000
+
+/** Browser half polls this to learn which session the last click asked for. */
+const OPEN_ROUTE = '/approval-alert/open'
+
+/**
  * Flag order matters: `-File` must come last, and the script takes no
  * positional arguments because every value arrives through the environment.
  */
@@ -257,6 +270,90 @@ export function powershellPath() {
 }
 
 // ---------------------------------------------------------------------------
+// Browser hand-off
+// ---------------------------------------------------------------------------
+
+function headerValue(request, name) {
+  const value = request?.headers?.[name]
+  if (Array.isArray(value)) return value[0]
+  return typeof value === 'string' ? value : undefined
+}
+
+function sendJson(response, status, body) {
+  const text = JSON.stringify(body)
+  response.statusCode = status
+  response.setHeader('content-type', 'application/json; charset=utf-8')
+  response.setHeader('cache-control', 'no-store')
+  response.end(text)
+}
+
+/**
+ * Whether a request comes from another origin. The browser half is the only
+ * caller, so anything cross-site is refused even though the route is local.
+ *
+ * @param {unknown} request - incoming request.
+ * @param {string | undefined} expected - this server's origin, when known.
+ * @returns {boolean} true when the request must be rejected.
+ */
+function requestCrossesOrigin(request, expected) {
+  const fetchSite = headerValue(request, 'sec-fetch-site')
+  if (fetchSite !== undefined) return fetchSite !== 'same-origin'
+  const origin = headerValue(request, 'origin')
+  return origin !== undefined && expected !== undefined && origin !== expected
+}
+
+/**
+ * Build the route the browser half polls. The click itself happens in a card
+ * process, so the answer is a small piece of state the page reads when it next
+ * looks, not a push: a page that is hidden, reloading or briefly offline still
+ * finds the request once it comes back.
+ *
+ * @param {{ state: { seq: number, sessionId: string, at: number }, getOrigin?: () => string | undefined }} options
+ * @returns {(request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse) => Promise<void>}
+ */
+export function createOpenHandler(options) {
+  const state = options.state
+  const getOrigin = typeof options.getOrigin === 'function' ? options.getOrigin : () => undefined
+
+  return async function openHandler(request, response) {
+    try {
+      const method = typeof request.method === 'string' ? request.method.toUpperCase() : 'GET'
+      let expected
+      try {
+        expected = getOrigin()
+      } catch {
+        expected = undefined
+      }
+      if (requestCrossesOrigin(request, expected)) {
+        sendJson(response, 403, { error: 'forbidden' })
+        return
+      }
+      if (method !== 'GET' && method !== 'HEAD') {
+        sendJson(response, 405, { error: 'method not allowed' })
+        return
+      }
+
+      const url = new URL(typeof request.url === 'string' ? request.url : '/', 'http://localhost')
+      const rawSince = url.searchParams.get('since')
+      const since = rawSince === null ? -1 : Number.parseInt(rawSince, 10)
+      const known = Number.isFinite(since) ? since : -1
+      const fresh = state.at > 0 && Date.now() - state.at <= MAX_OPEN_AGE_MS
+      const sessionId = fresh && state.seq > known ? state.sessionId : ''
+
+      sendJson(response, 200, {
+        seq: state.seq,
+        sessionId,
+        at: state.at,
+        now: Date.now(),
+      })
+      return
+    } catch {
+      sendJson(response, 500, { error: 'internal error' })
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -288,6 +385,8 @@ export function apply(ctx, config) {
   const live = new Map()
   /** session id -> the one answer card kept for that session. */
   const answerCards = new Map()
+  /** The session the last card click asked to show, read by the browser half. */
+  const pendingOpen = { seq: 0, sessionId: '', at: 0 }
   let sequence = 0
   let disposed = false
 
@@ -358,8 +457,15 @@ export function apply(ctx, config) {
       live.delete(key)
       logger?.debug?.(`approval-alert: alert process failed: ${String(error)}`)
     })
-    child.once('exit', () => {
+    child.once('exit', (code) => {
       live.delete(key)
+      // The action button activated the window and asked for this session.
+      if (code === EXIT_OPEN_SESSION && typeof card.sessionId === 'string' && card.sessionId.length > 0) {
+        pendingOpen.seq += 1
+        pendingOpen.sessionId = card.sessionId
+        pendingOpen.at = Date.now()
+        logger?.debug?.(`approval-alert: open request for ${card.sessionId}`)
+      }
     })
 
     return handle
@@ -393,6 +499,7 @@ export function apply(ctx, config) {
     const tool = typeof request?.toolName === 'string' ? request.toolName : ''
     return withCard({
       kind: 'approval',
+      sessionId: typeof request?.agent?.id === 'string' ? request.agent.id : '',
       title: settings.title,
       headline: tool.length > 0 ? `AI 请求使用工具：${tool}` : 'AI 请求一项受限操作',
       detail: approvalReason(request) || '请在 DeepSeek Harness 中允许或拒绝这次请求',
@@ -408,6 +515,7 @@ export function apply(ctx, config) {
       const session = shortSession(request?.agent?.id)
       return withCard({
         kind: 'question',
+        sessionId: typeof request?.agent?.id === 'string' ? request.agent.id : '',
         title: settings.questionTitle,
         headline: 'AI 正在等待你的回答',
         detail: questionReason(request) || '请在 DeepSeek Harness 中回答这个问题',
@@ -438,6 +546,7 @@ export function apply(ctx, config) {
 
       const handle = openCard({
         kind: 'finished',
+        sessionId: id,
         title: settings.finishedTitle,
         headline: '回答已完成，可以查看',
         detail: replyPreview(session) || '这一轮回答已经结束',
@@ -449,6 +558,23 @@ export function apply(ctx, config) {
       if (handle !== undefined) answerCards.set(id, handle)
     })
   }
+
+  // The browser half polls this route to learn which session the click asked
+  // for. The web server may mount after this row, so wait for the service
+  // instead of probing once; a headless Host simply never serves it.
+  ctx.inject(['webServer'], (scope) => {
+    const web = scope.webServer
+    if (web === undefined || web === null || typeof web.register !== 'function') return
+    const handler = createOpenHandler({
+      state: pendingOpen,
+      getOrigin: () => web.getOrigin(),
+    })
+    try {
+      scope.effect(() => web.register({ kind: 'exact', path: OPEN_ROUTE, handler }), 'approval-alert: open route')
+    } catch (error) {
+      logger?.warn?.(`approval-alert: could not register ${OPEN_ROUTE}: ${String(error)}`)
+    }
+  })
 
   ctx.effect(() => () => {
     disposed = true
